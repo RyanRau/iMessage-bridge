@@ -23,7 +23,8 @@ jobs:
       - name: Build binary
         run: pyinstaller --onefile --name imessage-bridge server.py
 
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: dist/imessage-bridge
+          name: imessage-bridge
+          path: dist/imessage-bridge
