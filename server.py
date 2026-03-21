@@ -10,6 +10,30 @@ import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
+
+def check_permissions():
+    # Full Disk Access — needed to read chat.db
+    try:
+        open(os.path.expanduser("~/Library/Messages/chat.db"), "rb").close()
+    except (PermissionError, OSError):
+        print("Full Disk Access is required to read Messages.")
+        print("Opening System Settings — grant access for this app, then relaunch.")
+        subprocess.run([
+            "open",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+        ])
+        raise SystemExit(1)
+
+    # Automation (Messages) — trigger the permission prompt now rather than mid-request
+    result = subprocess.run(
+        ["osascript", "-e", 'tell application "Messages" to get name'],
+        capture_output=True
+    )
+    if result.returncode != 0:
+        print("Automation access for Messages is required to send messages.")
+        print("Please allow access when prompted, then relaunch.")
+        raise SystemExit(1)
+
 load_dotenv()
 
 # CHAT_TARGETS is a comma-separated list of phone numbers / Apple IDs
@@ -164,6 +188,7 @@ def health():
 
 
 if __name__ == "__main__":
+    check_permissions()
     chat_rowid_map = resolve_chat_rowids()
     if not chat_rowid_map:
         raise SystemExit("No valid targets resolved. Check CHAT_TARGET in .env")
