@@ -1,3 +1,4 @@
+import base64
 import os
 import sqlite3
 import threading
@@ -42,6 +43,7 @@ WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 PORT = int(os.getenv("PORT", 5000))
 HOST = os.getenv("HOST", "127.0.0.1")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 2))
+HOST_HANDLE = os.getenv("HOST_HANDLE", "").strip()
 DB_PATH = os.path.expanduser("~/Library/Messages/chat.db")
 DB_URI = f"file:{DB_PATH}?mode=ro"
 
@@ -100,6 +102,95 @@ def apple_timestamp_to_datetime(ts):
     return datetime.fromtimestamp(unix_ts, tz=timezone.utc).replace(tzinfo=None)
 
 
+def fetch_attachments(conn, message_rowid: int) -> list:
+    rows = conn.execute(
+        """
+        SELECT a.filename, a.mime_type, a.transfer_name, a.total_bytes
+        FROM message_attachment_join maj
+        JOIN attachment a ON a.ROWID = maj.attachment_id
+        WHERE maj.message_id = ?
+        """,
+        (message_rowid,),
+    ).fetchall()
+    result = []
+    for filename, mime_type, transfer_name, total_bytes in rows:
+        entry = {
+            "filename": filename,
+            "mime_type": mime_type,
+            "transfer_name": transfer_name,
+            "total_bytes": total_bytes,
+        }
+        if mime_type and mime_type.startswith("image/"):
+            try:
+                path = os.path.expanduser(filename)
+                with open(path, "rb") as f:
+                    entry["data"] = base64.b64encode(f.read()).decode()
+            except OSError as e:
+                print(f"[attachment] could not read {filename}: {e}")
+                entry["data"] = None
+        result.append(entry)
+    return result
+
+
+def extract_mentions(attributed_body) -> list:
+    if attributed_body is None:
+        return []
+    try:
+        plist = plistlib.loads(bytes(attributed_body))
+        objects = plist.get("$objects", [])
+        mentions = []
+        for obj in objects:
+            if isinstance(obj, dict):
+                value = obj.get("__kIMMentionConfirmedMention")
+                if value is None:
+                    continue
+                if isinstance(value, plistlib.UID):
+                    value = objects[value.integer]
+                if isinstance(value, str):
+                    mentions.append(value)
+        return mentions
+    except Exception:
+        return []
+
+
+def fetch_reply_chain(conn, reply_to_guid, max_depth: int = 5) -> list:
+    if not reply_to_guid:
+        return []
+    chain = []
+    current_guid = reply_to_guid
+    for _ in range(max_depth):
+        row = conn.execute(
+            """
+            SELECT m.guid, m.text, m.attributedBody, m.is_from_me, m.date,
+                   m.reply_to_guid, h.id as sender
+            FROM message m
+            LEFT JOIN handle h ON m.handle_id = h.ROWID
+            WHERE m.guid = ?
+            """,
+            (current_guid,),
+        ).fetchone()
+        if row is None:
+            break
+        guid, text_col, attributed_body, is_from_me, date, next_guid, sender = row
+        text = extract_text(text_col, attributed_body)
+        try:
+            timestamp = apple_timestamp_to_datetime(date).isoformat()
+        except Exception:
+            timestamp = None
+        chain.append({
+            "guid": guid,
+            "text": text,
+            "sender": sender or "unknown",
+            "is_from_me": bool(is_from_me),
+            "timestamp": timestamp,
+        })
+        if not next_guid:
+            break
+        current_guid = next_guid
+    chain.reverse()
+    return chain
+
+
 def poll(chat_rowid_map):
     global last_rowid
     target_chat_ids = set(chat_rowid_map.values())
@@ -110,7 +201,7 @@ def poll(chat_rowid_map):
                 rows = conn.execute(
                     """
                     SELECT m.ROWID, m.text, m.attributedBody, m.is_from_me, m.date,
-                           h.id as sender, cmj.chat_id
+                           h.id as sender, cmj.chat_id, m.guid, m.reply_to_guid
                     FROM message m
                     JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
                     LEFT JOIN handle h ON m.handle_id = h.ROWID
@@ -121,7 +212,7 @@ def poll(chat_rowid_map):
                 ).fetchall()
 
             for row in rows:
-                rowid, text_col, attributed_body, is_from_me, date, sender, chat_id = row
+                rowid, text_col, attributed_body, is_from_me, date, sender, chat_id, guid, reply_to_guid = row
                 text = extract_text(text_col, attributed_body)
                 last_rowid = rowid
 
@@ -136,12 +227,23 @@ def poll(chat_rowid_map):
                 direction = "me" if is_from_me else (sender or "unknown")
                 print(f"[recv] from={direction} | time={timestamp} | text={text!r}")
 
+                mentions = extract_mentions(attributed_body)
+                mentioned = bool(HOST_HANDLE and HOST_HANDLE in mentions)
+
+                with get_connection() as conn2:
+                    attachments = fetch_attachments(conn2, rowid)
+                    reply_chain = fetch_reply_chain(conn2, reply_to_guid)
+
                 payload = {
                     "rowid": rowid,
+                    "guid": guid,
                     "text": text,
                     "is_from_me": bool(is_from_me),
                     "timestamp": timestamp,
                     "sender": sender or "unknown",
+                    "mentioned": mentioned,
+                    "attachments": attachments,
+                    "reply_chain": reply_chain,
                 }
                 try:
                     requests.post(WEBHOOK_URL, json=payload, timeout=5)
