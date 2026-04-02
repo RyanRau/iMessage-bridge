@@ -294,7 +294,7 @@ def poll(chat_rowid_map: dict, contact_cache: dict):
                 text = extract_text(text_col, attributed_body)
                 last_rowid = rowid
 
-                if not text or chat_id not in target_chat_ids:
+                if not text or chat_id not in target_chat_ids or is_from_me:
                     continue
 
                 meta = chat_rowid_map[chat_id]
@@ -303,8 +303,6 @@ def poll(chat_rowid_map: dict, contact_cache: dict):
                     timestamp = apple_timestamp_to_datetime(date).isoformat()
                 except Exception:
                     timestamp = None
-
-                direction = "me" if is_from_me else (sender or "unknown")
 
                 mentions = extract_mentions(attributed_body)
                 mentioned = bool(HOST_HANDLE and HOST_HANDLE in mentions)
@@ -325,7 +323,6 @@ def poll(chat_rowid_map: dict, contact_cache: dict):
                     "chat_name": meta["display_name"],
                     "is_group": meta["is_group"],
                     "text": text,
-                    "is_from_me": bool(is_from_me),
                     "timestamp": timestamp,
                     "sender": sender or "unknown",
                     "sender_name": sender_name,
@@ -333,7 +330,7 @@ def poll(chat_rowid_map: dict, contact_cache: dict):
                     "attachments": log_attachments,
                 }
                 print(
-                    f"[recv] chat={meta['chat_identifier']} from={direction}\n{json.dumps(log_payload, indent=2)}")
+                    f"[recv] chat={meta['chat_identifier']} from={sender or 'unknown'}\n{json.dumps(log_payload, indent=2)}")
 
                 webhook_url = meta["webhook_url"]
                 if webhook_url:
