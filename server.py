@@ -1,3 +1,4 @@
+import sys
 import base64
 import json
 import os
@@ -47,7 +48,8 @@ HOST_HANDLE = os.getenv("HOST_HANDLE", "").strip()
 DB_PATH = os.path.expanduser("~/Library/Messages/chat.db")
 DB_URI = f"file:{DB_PATH}?mode=ro"
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_SCRIPT_DIR = os.path.dirname(sys.executable) if getattr(
+    sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 CHATS_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "chats.json")
 
 app = Flask(__name__)
@@ -72,8 +74,10 @@ def load_chats_config(path: str) -> list:
             continue
         webhook_url = entry.get("webhook_url") or default_url
         if not webhook_url:
-            print(f"[warn] no webhook_url for {identifier!r} and no default — will skip posting")
-        result.append({"chat_identifier": identifier, "webhook_url": webhook_url})
+            print(
+                f"[warn] no webhook_url for {identifier!r} and no default — will skip posting")
+        result.append({"chat_identifier": identifier,
+                      "webhook_url": webhook_url})
     return result
 
 
@@ -132,7 +136,8 @@ tell application "Contacts"
     end repeat
     return output
 end tell'''
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    result = subprocess.run(["osascript", "-e", script],
+                            capture_output=True, text=True)
     if result.returncode != 0:
         print(f"[contacts] could not load contacts: {result.stderr.strip()}")
         return {}
@@ -258,7 +263,8 @@ def extract_mentions(attributed_body) -> list:
     if b"__kIMMentionConfirmedMention" not in raw:
         return []
     text = raw.decode("latin-1")
-    emails = re.findall(r"[a-zA-Z0-9.+_%\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text)
+    emails = re.findall(
+        r"[a-zA-Z0-9.+_%\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text)
     phones = re.findall(r"\+\d{10,15}", text)
     return list(dict.fromkeys(emails + phones))
 
@@ -308,7 +314,8 @@ def poll(chat_rowid_map: dict, contact_cache: dict):
                     attachments = fetch_attachments(conn2, rowid)
 
                 log_attachments = [
-                    {**a, "data": f"<{len(a['data'])} chars>" if a.get("data") else None}
+                    {**a,
+                        "data": f"<{len(a['data'])} chars>" if a.get("data") else None}
                     for a in attachments
                 ]
                 log_payload = {
@@ -325,7 +332,8 @@ def poll(chat_rowid_map: dict, contact_cache: dict):
                     "mentioned": mentioned,
                     "attachments": log_attachments,
                 }
-                print(f"[recv] chat={meta['chat_identifier']} from={direction}\n{json.dumps(log_payload, indent=2)}")
+                print(
+                    f"[recv] chat={meta['chat_identifier']} from={direction}\n{json.dumps(log_payload, indent=2)}")
 
                 webhook_url = meta["webhook_url"]
                 if webhook_url:
@@ -335,7 +343,8 @@ def poll(chat_rowid_map: dict, contact_cache: dict):
                     except Exception as e:
                         print(f"[webhook] failed: {e}")
                 else:
-                    print(f"[webhook] no URL for {meta['chat_identifier']}, skipping")
+                    print(
+                        f"[webhook] no URL for {meta['chat_identifier']}, skipping")
 
         except Exception as e:
             print(f"[poll] error: {e}")
@@ -362,7 +371,8 @@ tell application "Messages"
     send "{safe_msg}" to targetBuddy
 end tell'''
 
-    subprocess.run(["osascript", "-e", script], check=True, capture_output=True)
+    subprocess.run(["osascript", "-e", script],
+                   check=True, capture_output=True)
 
 
 @app.route("/send", methods=["POST"])
@@ -379,7 +389,8 @@ def send():
     meta = chat_meta_by_identifier[recipient]
     try:
         send_imessage(recipient, message, is_group=meta["is_group"])
-        print(f"[send] to={recipient} | is_group={meta['is_group']} | text={message!r}")
+        print(
+            f"[send] to={recipient} | is_group={meta['is_group']} | text={message!r}")
         return jsonify({"status": "sent", "recipient": recipient})
     except subprocess.CalledProcessError as e:
         return jsonify({"error": e.stderr.decode(errors="replace")}), 500
@@ -396,7 +407,8 @@ if __name__ == "__main__":
     chat_configs = load_chats_config(CHATS_CONFIG_PATH)
     chat_rowid_map = resolve_chat_rowids(chat_configs)
     if not chat_rowid_map:
-        raise SystemExit("No valid chats resolved. Check chat identifiers in chats.json.")
+        raise SystemExit(
+            "No valid chats resolved. Check chat identifiers in chats.json.")
 
     chat_meta_by_identifier = {
         meta["chat_identifier"]: meta for meta in chat_rowid_map.values()
@@ -407,7 +419,8 @@ if __name__ == "__main__":
 
     last_rowid = seed_last_rowid()
 
-    t = threading.Thread(target=poll, args=(chat_rowid_map, contact_cache), daemon=True)
+    t = threading.Thread(target=poll, args=(
+        chat_rowid_map, contact_cache), daemon=True)
     t.start()
     print(f"Polling started on {HOST}:{PORT}")
 
