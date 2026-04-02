@@ -1,0 +1,16 @@
+{
+  "default_webhook_url": "https://n8n.example.com/webhook/default",
+  "chats": [
+    {
+      "chat_identifier": "chat012345678901234",
+      "webhook_url": "https://n8n.example.com/webhook/groupchat"
+    },
+    {
+      "chat_identifier": "+15551234567",
+      "webhook_url": "https://n8n.example.com/webhook/personal"
+    },
+    {
+      "chat_identifier": "+15559876543"
+    }
+  ]
+}

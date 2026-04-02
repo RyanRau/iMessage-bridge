@@ -1,5 +1,7 @@
 import base64
+import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -35,11 +37,9 @@ def check_permissions():
         print("Please allow access when prompted, then relaunch.")
         raise SystemExit(1)
 
+
 load_dotenv()
 
-# CHAT_TARGETS is a comma-separated list of phone numbers / Apple IDs
-CHAT_TARGETS = [t.strip() for t in os.environ["CHAT_TARGET"].split(",")]
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 PORT = int(os.getenv("PORT", 5000))
 HOST = os.getenv("HOST", "127.0.0.1")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 2))
@@ -47,28 +47,62 @@ HOST_HANDLE = os.getenv("HOST_HANDLE", "").strip()
 DB_PATH = os.path.expanduser("~/Library/Messages/chat.db")
 DB_URI = f"file:{DB_PATH}?mode=ro"
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CHATS_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "chats.json")
+
 app = Flask(__name__)
 
 last_rowid = 0
+chat_meta_by_identifier: dict = {}
+
+
+def load_chats_config(path: str) -> list:
+    if not os.path.exists(path):
+        raise SystemExit(
+            f"chats.json not found at {path}\n"
+            "Copy chats.json.example to chats.json and configure your chats."
+        )
+    with open(path) as f:
+        config = json.load(f)
+    default_url = config.get("default_webhook_url")
+    result = []
+    for entry in config.get("chats", []):
+        identifier = entry.get("chat_identifier", "").strip()
+        if not identifier:
+            continue
+        webhook_url = entry.get("webhook_url") or default_url
+        if not webhook_url:
+            print(f"[warn] no webhook_url for {identifier!r} and no default — will skip posting")
+        result.append({"chat_identifier": identifier, "webhook_url": webhook_url})
+    return result
 
 
 def get_connection():
     return sqlite3.connect(DB_URI, uri=True)
 
 
-def resolve_chat_rowids():
+def resolve_chat_rowids(chat_configs: list) -> dict:
+    """Returns {rowid: {chat_identifier, display_name, style, is_group, webhook_url}}"""
     mapping = {}
     with get_connection() as conn:
         conn.row_factory = sqlite3.Row
-        for target in CHAT_TARGETS:
+        for cfg in chat_configs:
+            identifier = cfg["chat_identifier"]
             row = conn.execute(
-                "SELECT * FROM chat WHERE chat_identifier = ? LIMIT 1",
-                (target,),
+                "SELECT ROWID, chat_identifier, display_name, style FROM chat WHERE chat_identifier = ? LIMIT 1",
+                (identifier,),
             ).fetchone()
             if row is None:
-                print(f"[warn] no chat found for target: {target!r}")
+                print(f"[warn] no chat found for: {identifier!r}")
             else:
-                mapping[target] = row["ROWID"]
+                is_group = row["style"] == 43 or bool(row["display_name"])
+                mapping[row["ROWID"]] = {
+                    "chat_identifier": identifier,
+                    "display_name": row["display_name"],
+                    "style": row["style"],
+                    "is_group": is_group,
+                    "webhook_url": cfg["webhook_url"],
+                }
     return mapping
 
 
@@ -78,19 +112,83 @@ def seed_last_rowid():
     return row[0] or 0
 
 
+def normalize_phone(raw: str) -> str:
+    return re.sub(r"\D", "", raw)
+
+
+def build_contact_cache() -> dict:
+    """Query macOS Contacts via osascript and return {handle -> display_name}."""
+    script = '''
+tell application "Contacts"
+    set output to ""
+    repeat with p in people
+        set pName to name of p
+        repeat with ph in phones of p
+            set output to output & (value of ph) & "\t" & pName & "\n"
+        end repeat
+        repeat with em in emails of p
+            set output to output & (value of em) & "\t" & pName & "\n"
+        end repeat
+    end repeat
+    return output
+end tell'''
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"[contacts] could not load contacts: {result.stderr.strip()}")
+        return {}
+    cache = {}
+    for line in result.stdout.strip().splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        value, name = parts[0].strip(), parts[1].strip()
+        if not value or not name:
+            continue
+        cache[value] = name
+        normalized = normalize_phone(value)
+        if normalized:
+            cache[normalized] = name
+    print(f"[contacts] loaded {len(cache)} entries")
+    return cache
+
+
+def resolve_sender_name(sender: str, cache: dict) -> str | None:
+    if not sender or not cache:
+        return None
+    if sender in cache:
+        return cache[sender]
+    return cache.get(normalize_phone(sender))
+
+
 def extract_text(text_col, attributed_body):
     if text_col:
         return text_col
     if attributed_body is None:
         return ""
-    try:
-        plist = plistlib.loads(bytes(attributed_body))
-        objects = plist.get("$objects", [])
-        for obj in objects:
-            if isinstance(obj, str) and obj != "$null":
-                return obj
-    except Exception:
-        pass
+    raw = bytes(attributed_body)
+    # Binary plist (NSKeyedArchiver)
+    if raw[:8] == b"bplist00":
+        try:
+            plist = plistlib.loads(raw)
+            objects = plist.get("$objects", [])
+            for obj in objects:
+                if isinstance(obj, str) and obj != "$null":
+                    return obj
+        except Exception:
+            pass
+        return ""
+    # Typedstream: skip known boilerplate and return first readable string
+    _TS_SKIP = {
+        "streamtyped", "NSString", "NSMutableString", "NSAttributedString",
+        "NSMutableAttributedString", "NSDictionary", "NSMutableDictionary",
+        "NSObject", "NSArray", "NSMutableArray", "NSColor", "NSFont",
+        "NSParagraphStyle", "NSMutableParagraphStyle",
+    }
+    text = raw.decode("latin-1")
+    for m in re.finditer(r"[\x20-\x7e]{2,}", text):
+        s = m.group()
+        if s not in _TS_SKIP and not s.startswith("__k") and not s.startswith("NS"):
+            return s
     return ""
 
 
@@ -135,65 +233,39 @@ def fetch_attachments(conn, message_rowid: int) -> list:
 def extract_mentions(attributed_body) -> list:
     if attributed_body is None:
         return []
-    try:
-        plist = plistlib.loads(bytes(attributed_body))
-        objects = plist.get("$objects", [])
-        mentions = []
-        for obj in objects:
-            if isinstance(obj, dict):
-                value = obj.get("__kIMMentionConfirmedMention")
-                if value is None:
-                    continue
-                if isinstance(value, plistlib.UID):
-                    value = objects[value.integer]
-                if isinstance(value, str):
-                    mentions.append(value)
-        return mentions
-    except Exception:
-        return []
+    raw = bytes(attributed_body)
 
-
-def fetch_reply_chain(conn, reply_to_guid, max_depth: int = 5) -> list:
-    if not reply_to_guid:
-        return []
-    chain = []
-    current_guid = reply_to_guid
-    for _ in range(max_depth):
-        row = conn.execute(
-            """
-            SELECT m.guid, m.text, m.attributedBody, m.is_from_me, m.date,
-                   m.reply_to_guid, h.id as sender
-            FROM message m
-            LEFT JOIN handle h ON m.handle_id = h.ROWID
-            WHERE m.guid = ?
-            """,
-            (current_guid,),
-        ).fetchone()
-        if row is None:
-            break
-        guid, text_col, attributed_body, is_from_me, date, next_guid, sender = row
-        text = extract_text(text_col, attributed_body)
+    # Binary plist (NSKeyedArchiver) — newer macOS
+    if raw[:8] == b"bplist00":
         try:
-            timestamp = apple_timestamp_to_datetime(date).isoformat()
+            plist = plistlib.loads(raw)
+            objects = plist.get("$objects", [])
+            mentions = []
+            for obj in objects:
+                if isinstance(obj, dict):
+                    value = obj.get("__kIMMentionConfirmedMention")
+                    if value is None:
+                        continue
+                    if isinstance(value, plistlib.UID):
+                        value = objects[value.integer]
+                    if isinstance(value, str):
+                        mentions.append(value)
+            return mentions
         except Exception:
-            timestamp = None
-        chain.append({
-            "guid": guid,
-            "text": text,
-            "sender": sender or "unknown",
-            "is_from_me": bool(is_from_me),
-            "timestamp": timestamp,
-        })
-        if not next_guid:
-            break
-        current_guid = next_guid
-    chain.reverse()
-    return chain
+            return []
+
+    # Typedstream (NSUnarchiver / legacy format) — scan for Apple ID patterns
+    if b"__kIMMentionConfirmedMention" not in raw:
+        return []
+    text = raw.decode("latin-1")
+    emails = re.findall(r"[a-zA-Z0-9.+_%\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text)
+    phones = re.findall(r"\+\d{10,15}", text)
+    return list(dict.fromkeys(emails + phones))
 
 
-def poll(chat_rowid_map):
+def poll(chat_rowid_map: dict, contact_cache: dict):
     global last_rowid
-    target_chat_ids = set(chat_rowid_map.values())
+    target_chat_ids = set(chat_rowid_map.keys())
 
     while True:
         try:
@@ -201,7 +273,7 @@ def poll(chat_rowid_map):
                 rows = conn.execute(
                     """
                     SELECT m.ROWID, m.text, m.attributedBody, m.is_from_me, m.date,
-                           h.id as sender, cmj.chat_id, m.guid, m.reply_to_guid
+                           h.id as sender, cmj.chat_id, m.guid
                     FROM message m
                     JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
                     LEFT JOIN handle h ON m.handle_id = h.ROWID
@@ -212,12 +284,14 @@ def poll(chat_rowid_map):
                 ).fetchall()
 
             for row in rows:
-                rowid, text_col, attributed_body, is_from_me, date, sender, chat_id, guid, reply_to_guid = row
+                rowid, text_col, attributed_body, is_from_me, date, sender, chat_id, guid = row
                 text = extract_text(text_col, attributed_body)
                 last_rowid = rowid
 
                 if not text or chat_id not in target_chat_ids:
                     continue
+
+                meta = chat_rowid_map[chat_id]
 
                 try:
                     timestamp = apple_timestamp_to_datetime(date).isoformat()
@@ -225,30 +299,43 @@ def poll(chat_rowid_map):
                     timestamp = None
 
                 direction = "me" if is_from_me else (sender or "unknown")
-                print(f"[recv] from={direction} | time={timestamp} | text={text!r}")
 
                 mentions = extract_mentions(attributed_body)
                 mentioned = bool(HOST_HANDLE and HOST_HANDLE in mentions)
+                sender_name = resolve_sender_name(sender, contact_cache)
 
                 with get_connection() as conn2:
                     attachments = fetch_attachments(conn2, rowid)
-                    reply_chain = fetch_reply_chain(conn2, reply_to_guid)
 
-                payload = {
+                log_attachments = [
+                    {**a, "data": f"<{len(a['data'])} chars>" if a.get("data") else None}
+                    for a in attachments
+                ]
+                log_payload = {
                     "rowid": rowid,
                     "guid": guid,
+                    "chat_identifier": meta["chat_identifier"],
+                    "chat_name": meta["display_name"],
+                    "is_group": meta["is_group"],
                     "text": text,
                     "is_from_me": bool(is_from_me),
                     "timestamp": timestamp,
                     "sender": sender or "unknown",
+                    "sender_name": sender_name,
                     "mentioned": mentioned,
-                    "attachments": attachments,
-                    "reply_chain": reply_chain,
+                    "attachments": log_attachments,
                 }
-                try:
-                    requests.post(WEBHOOK_URL, json=payload, timeout=5)
-                except Exception as e:
-                    print(f"[webhook] failed: {e}")
+                print(f"[recv] chat={meta['chat_identifier']} from={direction}\n{json.dumps(log_payload, indent=2)}")
+
+                webhook_url = meta["webhook_url"]
+                if webhook_url:
+                    payload = {**log_payload, "attachments": attachments}
+                    try:
+                        requests.post(webhook_url, json=payload, timeout=5)
+                    except Exception as e:
+                        print(f"[webhook] failed: {e}")
+                else:
+                    print(f"[webhook] no URL for {meta['chat_identifier']}, skipping")
 
         except Exception as e:
             print(f"[poll] error: {e}")
@@ -256,14 +343,25 @@ def poll(chat_rowid_map):
         time.sleep(POLL_INTERVAL)
 
 
-def send_imessage(recipient: str, message: str):
-    safe = message.replace("\\", "\\\\").replace('"', '\\"')
-    script = f'''
+def send_imessage(recipient: str, message: str, is_group: bool = False):
+    safe_msg = message.replace("\\", "\\\\").replace('"', '\\"')
+    safe_recipient = recipient.replace("\\", "\\\\").replace('"', '\\"')
+
+    if is_group:
+        script = f'''
 tell application "Messages"
     set targetService to 1st service whose service type = iMessage
-    set targetBuddy to buddy "{recipient}" of targetService
-    send "{safe}" to targetBuddy
+    set targetChat to first chat of targetService whose id is "{safe_recipient}"
+    send "{safe_msg}" to targetChat
 end tell'''
+    else:
+        script = f'''
+tell application "Messages"
+    set targetService to 1st service whose service type = iMessage
+    set targetBuddy to buddy "{safe_recipient}" of targetService
+    send "{safe_msg}" to targetBuddy
+end tell'''
+
     subprocess.run(["osascript", "-e", script], check=True, capture_output=True)
 
 
@@ -271,14 +369,17 @@ end tell'''
 def send():
     data = request.get_json(force=True, silent=True) or {}
     message = data.get("message", "").strip()
-    recipient = data.get("recipient", CHAT_TARGETS[0]).strip()
+    recipient = data.get("recipient", "").strip()
     if not message:
         return jsonify({"error": "message is required"}), 400
-    if recipient not in CHAT_TARGETS:
-        return jsonify({"error": "recipient not in allowed targets", "allowed": CHAT_TARGETS}), 403
+    if not recipient:
+        return jsonify({"error": "recipient is required"}), 400
+    if recipient not in chat_meta_by_identifier:
+        return jsonify({"error": "recipient not in allowed targets", "allowed": list(chat_meta_by_identifier)}), 403
+    meta = chat_meta_by_identifier[recipient]
     try:
-        send_imessage(recipient, message)
-        print(f"[send] to={recipient} | text={message!r}")
+        send_imessage(recipient, message, is_group=meta["is_group"])
+        print(f"[send] to={recipient} | is_group={meta['is_group']} | text={message!r}")
         return jsonify({"status": "sent", "recipient": recipient})
     except subprocess.CalledProcessError as e:
         return jsonify({"error": e.stderr.decode(errors="replace")}), 500
@@ -291,14 +392,22 @@ def health():
 
 if __name__ == "__main__":
     check_permissions()
-    chat_rowid_map = resolve_chat_rowids()
+
+    chat_configs = load_chats_config(CHATS_CONFIG_PATH)
+    chat_rowid_map = resolve_chat_rowids(chat_configs)
     if not chat_rowid_map:
-        raise SystemExit("No valid targets resolved. Check CHAT_TARGET in .env")
-    print(f"Monitoring: {list(chat_rowid_map.keys())}")
+        raise SystemExit("No valid chats resolved. Check chat identifiers in chats.json.")
+
+    chat_meta_by_identifier = {
+        meta["chat_identifier"]: meta for meta in chat_rowid_map.values()
+    }
+    print(f"Monitoring: {list(chat_meta_by_identifier.keys())}")
+
+    contact_cache = build_contact_cache()
 
     last_rowid = seed_last_rowid()
 
-    t = threading.Thread(target=poll, args=(chat_rowid_map,), daemon=True)
+    t = threading.Thread(target=poll, args=(chat_rowid_map, contact_cache), daemon=True)
     t.start()
     print(f"Polling started on {HOST}:{PORT}")
 
