@@ -48,7 +48,9 @@ Controls which chats are monitored and where messages are routed:
   "chats": [
     {
       "chat_identifier": "chat012345678901234",
-      "webhook_url": "https://n8n.example.com/webhook/groupchat"
+      "webhook_url": "https://n8n.example.com/webhook/groupchat",
+      "applescript_id": "any;+;4ea9921929b142078cb49b7788edba8b",
+      "mention_only": true
     },
     {
       "chat_identifier": "+15551234567",
@@ -63,6 +65,8 @@ Controls which chats are monitored and where messages are routed:
 
 - `chat_identifier` — the value from `helpers/list_chats.py`
 - `webhook_url` — per-chat destination; falls back to `default_webhook_url` if omitted
+- `applescript_id` — required for group chats to send replies; get this value by running `python helpers/list_applescript_chats.py`
+- `mention_only` — if `true`, only fires the webhook when `HOST_HANDLE` is @mentioned; requires `HOST_HANDLE` to be set in `.env`
 - If neither `webhook_url` nor `default_webhook_url` is set for a chat, the message is processed but not POSTed
 
 ### `.env`
@@ -137,8 +141,11 @@ curl -X POST http://localhost:5000/send \
 ## Helpers
 
 ```bash
-# List recent chats with their identifiers
+# List recent chats with their identifiers (chat_identifier values for chats.json)
 python helpers/list_chats.py [limit]
+
+# List chats as seen by the Messages AppleScript API (applescript_id values for group chat sends)
+python helpers/list_applescript_chats.py
 
 # Dump raw message data for debugging (plist, mentions, etc.)
 python helpers/dump_message.py <rowid>
