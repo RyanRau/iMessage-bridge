@@ -76,8 +76,12 @@ def load_chats_config(path: str) -> list:
         if not webhook_url:
             print(
                 f"[warn] no webhook_url for {identifier!r} and no default — will skip posting")
-        result.append({"chat_identifier": identifier,
-                      "webhook_url": webhook_url})
+        result.append({
+            "chat_identifier": identifier,
+            "webhook_url": webhook_url,
+            "applescript_id": entry.get("applescript_id", "").strip() or None,
+            "mention_only": bool(entry.get("mention_only", False)),
+        })
     return result
 
 
@@ -106,6 +110,7 @@ def resolve_chat_rowids(chat_configs: list) -> dict:
                     "style": row["style"],
                     "is_group": is_group,
                     "webhook_url": cfg["webhook_url"],
+                    "applescript_id": cfg.get("applescript_id"),
                 }
     return mapping
 
@@ -334,11 +339,14 @@ def poll(chat_rowid_map: dict, contact_cache: dict):
 
                 webhook_url = meta["webhook_url"]
                 if webhook_url:
-                    payload = {**log_payload, "attachments": attachments}
-                    try:
-                        requests.post(webhook_url, json=payload, timeout=5)
-                    except Exception as e:
-                        print(f"[webhook] failed: {e}")
+                    if meta["mention_only"] and not mentioned:
+                        print(f"[webhook] skipping (mention_only) chat={meta['chat_identifier']}")
+                    else:
+                        payload = {**log_payload, "attachments": attachments}
+                        try:
+                            requests.post(webhook_url, json=payload, timeout=5)
+                        except Exception as e:
+                            print(f"[webhook] failed: {e}")
                 else:
                     print(
                         f"[webhook] no URL for {meta['chat_identifier']}, skipping")
@@ -349,18 +357,19 @@ def poll(chat_rowid_map: dict, contact_cache: dict):
         time.sleep(POLL_INTERVAL)
 
 
-def send_imessage(recipient: str, message: str, is_group: bool = False):
+def send_imessage(recipient: str, message: str, is_group: bool = False, applescript_id: str | None = None):
     safe_msg = message.replace("\\", "\\\\").replace('"', '\\"')
-    safe_recipient = recipient.replace("\\", "\\\\").replace('"', '\\"')
 
     if is_group:
+        chat_id = applescript_id or recipient
+        safe_chat_id = chat_id.replace("\\", "\\\\").replace('"', '\\"')
         script = f'''
 tell application "Messages"
-    set targetService to 1st service whose service type = iMessage
-    set targetChat to first chat of targetService whose id is "{safe_recipient}"
+    set targetChat to first chat whose id is "{safe_chat_id}"
     send "{safe_msg}" to targetChat
 end tell'''
     else:
+        safe_recipient = recipient.replace("\\", "\\\\").replace('"', '\\"')
         script = f'''
 tell application "Messages"
     set targetService to 1st service whose service type = iMessage
@@ -385,7 +394,7 @@ def send():
         return jsonify({"error": "recipient not in allowed targets", "allowed": list(chat_meta_by_identifier)}), 403
     meta = chat_meta_by_identifier[recipient]
     try:
-        send_imessage(recipient, message, is_group=meta["is_group"])
+        send_imessage(recipient, message, is_group=meta["is_group"], applescript_id=meta.get("applescript_id"))
         print(
             f"[send] to={recipient} | is_group={meta['is_group']} | text={message!r}")
         return jsonify({"status": "sent", "recipient": recipient})

@@ -3,7 +3,9 @@
   "chats": [
     {
       "chat_identifier": "chat012345678901234",
-      "webhook_url": "https://n8n.example.com/webhook/groupchat"
+      "webhook_url": "https://n8n.example.com/webhook/groupchat",
+      "applescript_id": "iMessage;+;chat012345678901234",
+      "mention_only": true
     },
     {
       "chat_identifier": "+15551234567",
