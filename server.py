@@ -111,6 +111,7 @@ def resolve_chat_rowids(chat_configs: list) -> dict:
                     "is_group": is_group,
                     "webhook_url": cfg["webhook_url"],
                     "applescript_id": cfg.get("applescript_id"),
+                    "mention_only": cfg.get("mention_only", False),
                 }
     return mapping
 
@@ -430,4 +431,5 @@ if __name__ == "__main__":
     t.start()
     print(f"Polling started on {HOST}:{PORT}")
 
-    app.run(host=HOST, port=PORT)
+    from waitress import serve
+    serve(app, host=HOST, port=PORT)
